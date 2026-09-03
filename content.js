@@ -1,17 +1,21 @@
 /**
  * Springboard Companion - Content Script
  * 
- * Features:
- * 1. Course Mode:
- *    - Sequential module traversal (mark complete -> wait -> advance)
- *    - Dynamic video detection & auto-seek to completion
+ * Capabilities:
+ * 1. Course Traversal Mode:
+ *    - Sequential module progression (Mark Complete -> Wait -> Next)
+ *    - Dynamic video auto-seek to completion (mutes, seeks to duration - 0.2s, triggers ended/timeupdate)
  *    - Springboard internal message bus signaling
- * 2. Assignment / Quiz Mode:
- *    - Scrapes question statements and options (MCQ / checkbox)
- *    - Queries OpenAI-compatible API endpoint (OpenAI, OpenRouter, DeepSeek, Groq, Ollama, etc.)
- *    - Automatically selects correct option and clicks Save (#formSubmit)
- *    - Sequential batch solving across all questions via sidebar navigation
- *    - Cross-frame communication for embedded IAP assessment iframes
+ * 2. Assignment / Quiz Solver Mode:
+ *    - Variation 1: Infosys Assessment Platform (Angular Material / IAP)
+ *    - Variation 2: Techademy / Yaksha (React Material-UI / MUI)
+ *    - Scrapes question statements, code snippets, and radio options
+ *    - Calls custom OpenAI-compatible API endpoint via background service worker
+ *    - Automatically selects the best option and clicks Save / "Save & Next"
+ *    - Sequential batch solving across all questions in sidebar (1 to N)
+ * 3. Fullscreen Resiliency:
+ *    - Dynamically detects entering fullscreen mode and re-parents HUD inside the active
+ *      fullscreen container to prevent disappearing.
  */
 
 (function () {
@@ -107,7 +111,7 @@
   }
 
   // =========================================================================
-  // SECTION 1: COURSE AUTO-PROGRESSION & VIDEO SEEKING
+  // SECTION 1: COURSE AUTO-PROGRESSION & VIDEO AUTO-SEEK
   // =========================================================================
 
   function getCurrentModuleId() {
@@ -409,18 +413,23 @@
   }
 
   // =========================================================================
-  // SECTION 2: AI ASSIGNMENT & QUIZ SOLVER
+  // SECTION 2: AI ASSIGNMENT & QUIZ SOLVER (VARIATION 1 & VARIATION 2)
   // =========================================================================
 
   function getContestDocument() {
-    // If running directly inside the iframe:
-    if (document.querySelector('#problemStatement, app-question-details-mcq')) {
+    // 1. Direct document check
+    if (document.querySelector('#problemStatement, .quill-image-test, app-question-details-mcq')) {
       return document;
     }
-    // If running in top window, check for iap-iframe:
-    const iframe = document.getElementById('iap-iframe') || document.querySelector('iframe.iap-iframe');
-    if (iframe && iframe.contentDocument && iframe.contentDocument.querySelector('#problemStatement, app-question-details-mcq')) {
-      return iframe.contentDocument;
+    // 2. Iframe checks (search all accessible iframes on the page)
+    const iframes = Array.from(document.querySelectorAll('iframe'));
+    for (const ifr of iframes) {
+      try {
+        const idoc = ifr.contentDocument || ifr.contentWindow?.document;
+        if (idoc && idoc.querySelector('#problemStatement, .quill-image-test, app-question-details-mcq, input.PrivateSwitchBase-input')) {
+          return idoc;
+        }
+      } catch (_) {}
     }
     return null;
   }
@@ -428,35 +437,75 @@
   function scrapeCurrentQuestion(doc = null) {
     const targetDoc = doc || getContestDocument() || document;
 
-    const qStmtElem = targetDoc.querySelector('#problemStatement') || targetDoc.querySelector('.question-description');
-    if (!qStmtElem) return null;
+    // --- VARIATION 1: IAP / Infosys Assessment Platform (Angular Material) ---
+    const qStmtVar1 = targetDoc.querySelector('#problemStatement, .question-description');
+    const radioVar1 = targetDoc.querySelectorAll('mat-radio-button, mat-checkbox');
 
-    const qTitleElem = targetDoc.querySelector('#problem') || targetDoc.querySelector('.questionName');
-    const questionTitle = qTitleElem ? qTitleElem.innerText.trim() : 'Question';
+    if (qStmtVar1 && radioVar1.length > 0) {
+      const qTitleElem = targetDoc.querySelector('#problem, .questionName');
+      const questionTitle = qTitleElem ? qTitleElem.innerText.trim() : 'Question';
+      const statement = qStmtVar1.innerText.replace(/\u00a0/g, ' ').trim();
 
-    // Statement cleanup
-    let statement = qStmtElem.innerText.replace(/\u00a0/g, ' ').trim();
+      const options = Array.from(radioVar1).map((btn, idx) => {
+        const optTextElem = btn.querySelector('.options, .mat-radio-label-content') || btn;
+        const text = optTextElem.innerText.replace(/\u00a0/g, ' ').trim();
+        return {
+          index: idx,
+          element: btn,
+          text: text,
+          variant: 'iap'
+        };
+      });
 
-    // Scrape options
-    const radioElements = Array.from(targetDoc.querySelectorAll('mat-radio-button, mat-checkbox'));
-    if (radioElements.length === 0) return null;
-
-    const options = radioElements.map((btn, idx) => {
-      const optTextElem = btn.querySelector('.options') || btn.querySelector('.mat-radio-label-content') || btn;
-      const text = optTextElem.innerText.replace(/\u00a0/g, ' ').trim();
       return {
-        index: idx,
-        element: btn,
-        text: text
+        title: questionTitle,
+        statement,
+        options,
+        variant: 'iap',
+        doc: targetDoc
       };
-    });
+    }
 
-    return {
-      title: questionTitle,
-      statement,
-      options,
-      doc: targetDoc
-    };
+    // --- VARIATION 2: Techademy / Yaksha (React Material-UI / MUI) ---
+    const qStmtVar2 = targetDoc.querySelector('.quill-image-test, [class*="quill-image-test"], h6.MuiTypography-h6');
+    const radioInputsVar2 = targetDoc.querySelectorAll('input.PrivateSwitchBase-input[type="radio"], input[type="radio"]');
+
+    if (qStmtVar2 && radioInputsVar2.length > 0) {
+      const qNumElem = targetDoc.querySelector('.infoHeader + div h6, .MuiTypography-subtitle1');
+      const questionTitle = qNumElem ? `Question ${qNumElem.innerText.trim()}` : 'Question';
+      const statement = qStmtVar2.innerText.replace(/\u00a0/g, ' ').trim();
+
+      const options = Array.from(radioInputsVar2).map((inp, idx) => {
+        let text = inp.getAttribute('value') || '';
+        if (!text || text === '[object Object]') {
+          const parentRow = inp.closest('.MuiGrid-item, .MuiFormControlLabel-root, .MuiBox-root') || inp.parentElement;
+          if (parentRow) {
+            const textElem = parentRow.querySelector('p, span:not(.MuiRadio-root)') || parentRow;
+            text = textElem.innerText.trim();
+          }
+        }
+        text = text.replace(/\u00a0/g, ' ').trim();
+
+        const clickable = inp.closest('.MuiRadio-root, .MuiButtonBase-root') || inp;
+        return {
+          index: idx,
+          element: clickable,
+          input: inp,
+          text: text,
+          variant: 'techademy'
+        };
+      });
+
+      return {
+        title: questionTitle,
+        statement,
+        options,
+        variant: 'techademy',
+        doc: targetDoc
+      };
+    }
+
+    return null;
   }
 
   async function queryLlmAnswer(qData) {
@@ -472,7 +521,7 @@
     const messages = [
       {
         role: 'system',
-        content: 'You are an accurate exam quiz solver. Analyze the question and the provided options carefully. Pick the single best option index. Respond ONLY with a valid JSON object: {"best_option_index": <0-based integer>, "reason": "<brief justification>"}'
+        content: 'You are an accurate exam quiz solver in Computer Science and Data Science. Analyze the problem and options carefully. Pick the single best option index. Respond ONLY with a valid JSON object: {"best_option_index": <0-based integer>, "reason": "<brief justification>"}'
       },
       {
         role: 'user',
@@ -482,7 +531,6 @@
 
     logMessage(`Querying ${cfg.model} via ${cfg.baseUrl}...`, 'info');
 
-    // Call background service worker to avoid CORS restrictions
     const response = await new Promise((resolve, reject) => {
       chrome.runtime.sendMessage(
         {
@@ -510,7 +558,6 @@
 
     const replyContent = response.choices?.[0]?.message?.content || '';
     
-    // Parse JSON
     let parsed = null;
     const jsonMatch = replyContent.match(/\{[\s\S]*?\}/);
     if (jsonMatch) {
@@ -520,7 +567,6 @@
     }
 
     if (!parsed || typeof parsed.best_option_index !== 'number') {
-      // Fallback regex to search for option number
       const numMatch = replyContent.match(/option\s*\[?(\d+)\]?/i) || replyContent.match(/\b(\d+)\b/);
       if (numMatch) {
         const idx = parseInt(numMatch[1], 10);
@@ -531,7 +577,7 @@
     }
 
     if (!parsed || typeof parsed.best_option_index !== 'number') {
-      throw new Error(`Could not parse LLM answer from: "${replyContent.slice(0, 120)}..."`);
+      throw new Error(`Could not parse LLM answer: "${replyContent.slice(0, 120)}..."`);
     }
 
     return parsed;
@@ -543,25 +589,52 @@
     }
 
     const targetOption = qData.options[bestIndex];
-    const targetElement = targetOption.element;
+    logMessage(`Selecting Option [${bestIndex}]: "${targetOption.text.slice(0, 35)}..."`, 'info');
 
-    logMessage(`Selecting Option [${bestIndex}]: "${targetOption.text.slice(0, 30)}..."`, 'info');
-
-    // Click label or radio container
-    const clickable = targetElement.querySelector('label') || targetElement.querySelector('input') || targetElement;
-    clickable.click();
-    targetElement.dispatchEvent(new Event('change', { bubbles: true }));
+    if (qData.variant === 'techademy') {
+      const inp = targetOption.input;
+      if (inp) {
+        inp.checked = true;
+        inp.click();
+        inp.dispatchEvent(new Event('input', { bubbles: true }));
+        inp.dispatchEvent(new Event('change', { bubbles: true }));
+      }
+      if (targetOption.element) {
+        targetOption.element.click();
+      }
+    } else {
+      const targetElement = targetOption.element;
+      const clickable = targetElement.querySelector('label, input') || targetElement;
+      clickable.click();
+      targetElement.dispatchEvent(new Event('change', { bubbles: true }));
+    }
 
     if (autoSave) {
       await new Promise((r) => setTimeout(r, 450));
       const targetDoc = qData.doc || document;
-      const saveBtn = targetDoc.querySelector('#formSubmit') || targetDoc.querySelector("button[id='formSubmit']");
+
+      // 1. Check Var 2 "Save & Next" button
+      const allButtons = Array.from(targetDoc.querySelectorAll('button'));
+      const saveAndNextBtn = allButtons.find((b) => {
+        const t = (b.innerText || '').toLowerCase().replace(/\s+/g, ' ');
+        return t.includes('save & next') || t.includes('save and next');
+      });
+
+      if (saveAndNextBtn) {
+        saveAndNextBtn.click();
+        logMessage('Clicked "Save & Next".', 'success');
+        return true;
+      }
+
+      // 2. Check Var 1 "#formSubmit" Save button
+      const saveBtn = targetDoc.querySelector('#formSubmit, button[id="formSubmit"]');
       if (saveBtn) {
         saveBtn.click();
         logMessage('Answer saved.', 'success');
-      } else {
-        logMessage('Save button not found; option selected.', 'warning');
+        return true;
       }
+
+      logMessage('Save button not detected; option selected.', 'warning');
     }
 
     return true;
@@ -575,7 +648,7 @@
       return false;
     }
 
-    logMessage(`Found ${qData.title} (${qData.options.length} options)`, 'info');
+    logMessage(`Found ${qData.title} (${qData.options.length} options, ${qData.variant})`, 'info');
     updateHudStatusText(`Solving ${qData.title}...`);
 
     try {
@@ -602,12 +675,18 @@
 
     try {
       const targetDoc = getContestDocument() || document;
-      const sidebarBtns = Array.from(
+      
+      // Look for sidebar question buttons (Var 1 numeric IDs or Var 2 button.legends)
+      let sidebarBtns = Array.from(
         targetDoc.querySelectorAll("app-side-bar-mcq button.fabBtn, app-side-bar-mcq button[id]")
       ).filter((b) => /^\d+$/.test(b.id));
 
       if (sidebarBtns.length === 0) {
-        logMessage('No question navigation list detected in sidebar. Solving current question only...', 'warning');
+        sidebarBtns = Array.from(targetDoc.querySelectorAll("button.legends"));
+      }
+
+      if (sidebarBtns.length === 0) {
+        logMessage('No question navigation list detected. Solving current question only...', 'warning');
         await solveCurrentQuestion();
         return;
       }
@@ -626,7 +705,7 @@
         btn.click();
 
         // Wait for question to render
-        await new Promise((r) => setTimeout(r, 700));
+        await new Promise((r) => setTimeout(r, 750));
 
         const qData = scrapeCurrentQuestion(targetDoc);
         if (!qData) {
@@ -643,7 +722,6 @@
           logMessage(`Error solving Q${i + 1}: ${err.message}`, 'error');
         }
 
-        // Pacing delay between questions
         await new Promise((r) => setTimeout(r, 1200));
       }
 
@@ -677,17 +755,45 @@
   });
 
   // =========================================================================
-  // SECTION 3: FLOATING HUD UI & CONTROLLER
+  // SECTION 3: FULLSCREEN DYNAMIC RE-PARENTING
+  // =========================================================================
+
+  function handleFullscreenChange() {
+    const fsElement = document.fullscreenElement || 
+                      document.webkitFullscreenElement || 
+                      document.mozFullScreenElement || 
+                      document.msFullscreenElement;
+    const hud = document.getElementById('sb-hud-container');
+    if (!hud) return;
+
+    if (fsElement) {
+      if (!fsElement.contains(hud)) {
+        fsElement.appendChild(hud);
+        hud.style.zIndex = '2147483647';
+        logMessage('Entering Fullscreen: re-anchored HUD into fullscreen layer.', 'info');
+      }
+    } else {
+      if (hud.parentElement !== document.body && document.body) {
+        document.body.appendChild(hud);
+      }
+    }
+  }
+
+  document.addEventListener('fullscreenchange', handleFullscreenChange);
+  document.addEventListener('webkitfullscreenchange', handleFullscreenChange);
+  document.addEventListener('mozfullscreenchange', handleFullscreenChange);
+  document.addEventListener('MSFullscreenChange', handleFullscreenChange);
+
+  // =========================================================================
+  // SECTION 4: FLOATING HUD UI & CONTROLLER
   // =========================================================================
 
   function injectHud() {
     if (document.getElementById('sb-hud-container')) return;
 
-    // Avoid double HUD inside child iframes when top frame already has one,
-    // UNLESS this iframe is the contest itself running standalone
     const isTop = window.self === window.top;
-    const isIapStandalone = !isTop && document.querySelector('#problemStatement, app-question');
-    if (!isTop && !isIapStandalone) return;
+    const isContestStandalone = !isTop && document.querySelector('#problemStatement, .quill-image-test, app-question');
+    if (!isTop && !isContestStandalone) return;
 
     const hud = document.createElement('div');
     hud.id = 'sb-hud-container';
@@ -708,7 +814,7 @@
 
     const currentDelay = (getDelay() / 1000).toFixed(1);
     const cfg = getLlmConfig();
-    const activeTab = localStorage.getItem(STORAGE_KEYS.ACTIVE_TAB) || (isIapStandalone ? 'assignment' : 'course');
+    const activeTab = localStorage.getItem(STORAGE_KEYS.ACTIVE_TAB) || (isContestStandalone ? 'assignment' : 'course');
 
     hud.innerHTML = `
       <div id="sb-hud-header">
@@ -803,7 +909,6 @@
   }
 
   function setupHudEvents(hud) {
-    // Minimize Toggle
     const minBtn = hud.querySelector('#sb-hud-min-btn');
     minBtn.addEventListener('click', () => {
       hud.classList.toggle('minimized');
@@ -812,7 +917,6 @@
       minBtn.textContent = isMin ? '□' : '─';
     });
 
-    // Tab Switching
     const tabCourse = hud.querySelector('#sb-tab-course');
     const tabAssignment = hud.querySelector('#sb-tab-assignment');
     const contentCourse = hud.querySelector('#sb-tab-content-course');
@@ -837,7 +941,6 @@
     tabCourse.addEventListener('click', () => switchTab('course'));
     tabAssignment.addEventListener('click', () => switchTab('assignment'));
 
-    // Course Mode Controls
     const startBtn = hud.querySelector('#sb-hud-start-btn');
     const pauseBtn = hud.querySelector('#sb-hud-pause-btn');
     const nextBtn = hud.querySelector('#sb-hud-next-btn');
@@ -866,7 +969,6 @@
       setDelay(Math.round(val * 1000));
     });
 
-    // Assignment Mode Config Inputs
     const baseUrlInput = hud.querySelector('#sb-cfg-base-url');
     const apiKeyInput = hud.querySelector('#sb-cfg-api-key');
     const pwToggle = hud.querySelector('#sb-cfg-pw-toggle');
@@ -897,7 +999,6 @@
       }
     });
 
-    // Assignment Mode Solver Buttons
     const solveCurrBtn = hud.querySelector('#sb-hud-solve-curr-btn');
     const solveAllBtn = hud.querySelector('#sb-hud-solve-all-btn');
 
@@ -905,11 +1006,10 @@
       saveInputs();
       solveCurrBtn.disabled = true;
       try {
-        // Direct call or notify iframe
-        const iapIframe = document.getElementById('iap-iframe');
-        if (iapIframe && iapIframe.contentWindow) {
-          iapIframe.contentWindow.postMessage({ action: 'SB_SOLVE_CURRENT' }, '*');
-        }
+        const iframes = Array.from(document.querySelectorAll('iframe'));
+        iframes.forEach((ifr) => {
+          try { ifr.contentWindow?.postMessage({ action: 'SB_SOLVE_CURRENT' }, '*'); } catch (_) {}
+        });
         await solveCurrentQuestion();
       } finally {
         solveCurrBtn.disabled = false;
@@ -920,15 +1020,15 @@
       saveInputs();
       if (isSolvingBatch) {
         stopBatchSolver();
-        const iapIframe = document.getElementById('iap-iframe');
-        if (iapIframe && iapIframe.contentWindow) {
-          iapIframe.contentWindow.postMessage({ action: 'SB_STOP_SOLVER' }, '*');
-        }
+        const iframes = Array.from(document.querySelectorAll('iframe'));
+        iframes.forEach((ifr) => {
+          try { ifr.contentWindow?.postMessage({ action: 'SB_STOP_SOLVER' }, '*'); } catch (_) {}
+        });
       } else {
-        const iapIframe = document.getElementById('iap-iframe');
-        if (iapIframe && iapIframe.contentWindow) {
-          iapIframe.contentWindow.postMessage({ action: 'SB_SOLVE_ALL' }, '*');
-        }
+        const iframes = Array.from(document.querySelectorAll('iframe'));
+        iframes.forEach((ifr) => {
+          try { ifr.contentWindow?.postMessage({ action: 'SB_SOLVE_ALL' }, '*'); } catch (_) {}
+        });
         await solveAllQuestions();
       }
     });
@@ -992,7 +1092,7 @@
     let origY = 0;
 
     handle.addEventListener('mousedown', (e) => {
-      if (e.target.closest('button')) return;
+      if (e.target.closest('button, input')) return;
       isDragging = true;
       startX = e.clientX;
       startY = e.clientY;
@@ -1026,7 +1126,7 @@
   }
 
   // =========================================================================
-  // SECTION 4: INITIALIZATION
+  // SECTION 5: INITIALIZATION
   // =========================================================================
 
   function observeNavigation() {
@@ -1060,7 +1160,7 @@
     observeNavigation();
 
     if (isRunning()) {
-      logMessage('Resuming auto-progression loop...', 'info');
+      logMessage('Resuming course loop...', 'info');
       scheduleNextStep(1500);
     }
   }

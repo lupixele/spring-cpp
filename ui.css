@@ -1,9 +1,9 @@
 /* Springboard Companion Floating HUD Styling */
 #sb-hud-container {
-  position: fixed;
+  position: fixed !important;
   top: 24px;
   right: 24px;
-  z-index: 9999999;
+  z-index: 2147483647 !important;
   width: 330px;
   max-width: calc(100vw - 48px);
   background: rgba(18, 22, 34, 0.96);
@@ -19,6 +19,17 @@
   user-select: none;
   transition: box-shadow 0.2s ease, border-color 0.2s ease;
   overflow: hidden;
+}
+
+/* Fullscreen Top-Layer Support across all browser engines */
+:fullscreen #sb-hud-container,
+:-webkit-full-screen #sb-hud-container,
+:-moz-full-screen #sb-hud-container,
+:-ms-fullscreen #sb-hud-container {
+  position: fixed !important;
+  z-index: 2147483647 !important;
+  display: block !important;
+  visibility: visible !important;
 }
 
 #sb-hud-container:hover {
