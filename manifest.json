@@ -1,17 +1,30 @@
 {
   "manifest_version": 3,
   "name": "Springboard Companion",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Navigation assistant and viewer utilities for Springboard.",
   "permissions": [
     "storage"
   ],
+  "host_permissions": [
+    "*://*.onwingspan.com/*",
+    "*://infyspringboard.onwingspan.com/*",
+    "*://*.infosysapps.com/*",
+    "*://lex-iap.infosysapps.com/*",
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
   "content_scripts": [
     {
       "matches": [
         "*://*.onwingspan.com/*",
-        "*://infyspringboard.onwingspan.com/*"
+        "*://infyspringboard.onwingspan.com/*",
+        "*://*.infosysapps.com/*",
+        "*://lex-iap.infosysapps.com/*"
       ],
+      "all_frames": true,
       "css": [
         "ui.css"
       ],
